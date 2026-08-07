@@ -20,6 +20,70 @@
 
 require_once WP_PLUGIN_DIR . '/cardgate/cardgate-clientlib-php/init.php';
 
+if ( ! function_exists( 'cardgate_is_subscriptions_active' ) ) {
+	/**
+	 * Check whether the WooCommerce Subscriptions plugin is installed and activated.
+	 *
+	 * @return bool True when WooCommerce Subscriptions is active.
+	 */
+	function cardgate_is_subscriptions_active() {
+		if ( class_exists( 'WC_Subscriptions' ) ) {
+			return true;
+		}
+
+		$active_plugins = (array) get_option( 'active_plugins', array() );
+		if ( is_multisite() ) {
+			$active_plugins = array_merge( $active_plugins, array_keys( (array) get_site_option( 'active_sitewide_plugins', array() ) ) );
+		}
+
+		foreach ( $active_plugins as $plugin ) {
+			if ( 'woocommerce-subscriptions/woocommerce-subscriptions.php' === $plugin ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+}
+
+if ( ! function_exists( 'cardgate_load_action_scheduler' ) ) {
+	/**
+	 * Load the Action Scheduler library, but only when WooCommerce Subscriptions is active.
+	 *
+	 * Action Scheduler must be loaded no later than the plugins_loaded hook, see
+	 * https://actionscheduler.org/usage/ .
+	 *
+	 * @return void
+	 */
+	function cardgate_load_action_scheduler() {
+		if ( ! cardgate_is_subscriptions_active() ) {
+			return;
+		}
+
+		$action_scheduler = WP_PLUGIN_DIR . '/action-scheduler/action-scheduler.php';
+		if ( file_exists( $action_scheduler ) ) {
+			require_once $action_scheduler;
+		}
+	}
+}
+
+add_action( 'plugins_loaded', 'cardgate_load_action_scheduler', 0 );
+
+if ( ! function_exists( 'cardgate_unschedule_recurring_actions' ) ) {
+	/**
+	 * Remove any pending CardGate recurring actions when the plugin is deactivated.
+	 *
+	 * @return void
+	 */
+	function cardgate_unschedule_recurring_actions() {
+		if ( function_exists( 'as_unschedule_all_actions' ) ) {
+			as_unschedule_all_actions( 'cardgate_process_recurring_payment', array(), 'cardgate' );
+		}
+	}
+}
+
+register_deactivation_hook( __FILE__, 'cardgate_unschedule_recurring_actions' );
+
 /**
  * CardGate Class.
  */
@@ -521,42 +585,58 @@ class Cardgate {
 				exit( 'HashCheck failed.' );
 			}
 
-			$order_no = (int) substr( sanitize_text_field( wp_unslash( $_REQUEST['reference'] ) ), 11 );
+			$reference = sanitize_text_field( wp_unslash( $_REQUEST['reference'] ) );
+			$order_no  = (int) preg_replace( '/^O\d{10}/', '', $reference );
 
 			// process order.
-			$order        = new WC_Order( $order_no );
-			$order_status = $order->get_status();
+			$order = ( $order_no ? wc_get_order( $order_no ) : false );
+			if ( ! $order ) {
+				exit( 'unknown order' );
+			}
 
-			if ( ( 'processing' !== $order_status && 'completed' !== $order_status ) ) {
+			$transaction_id = sanitize_text_field( wp_unslash( $_REQUEST['transaction'] ) );
 
-				$code = (int) $_REQUEST['code'];
-
-				if ( $code >= 200 && $code < 300 ) {
-					// success.
-					$order->set_transaction_id( sanitize_text_field( wp_unslash( $_REQUEST['transaction'] ) ) );
-					$order->payment_complete();
-				}
-
-				if ( 0 === (int) $_REQUEST['code'] || 100 === (int) $_REQUEST['code'] ) {
-					$return_status = 'pending';
-				}
-				if ( (int) $_REQUEST['code'] >= 200 && (int) $_REQUEST['code'] < 300 ) {
-						$return_status = 'completed';
-				}
-				if ( $code >= 300 && $code < 400 ) {
-					$order->update_status( 'failed' );
-					$return_status = 'failed';
-				}
-				if ( $code >= 700 && $code < 800 ) {
-					$order->update_status( 'on-hold' );
-					$return_status = 'waiting';
-				}
-
-				$order->add_order_note( 'Curo transaction (' . sanitize_text_field( wp_unslash( $_REQUEST['transaction'] ) ) . ') payment ' . $return_status . '.' );
-				exit( esc_html( sanitize_text_field( wp_unslash( $_REQUEST['transaction'] ) ) . '.' . (int) $_REQUEST['code'] ) );
-			} else {
+			// Guard on the transaction id instead of the order status, so later
+			// status callbacks for renewal orders are still processed.
+			if ( $order->get_transaction_id() === $transaction_id && $order->is_paid() ) {
 				exit( 'payment already processed' );
 			}
+
+			$code          = (int) $_REQUEST['code'];
+			$return_status = 'unknown';
+
+			if ( 0 === $code || 100 === $code ) {
+				$return_status = 'pending';
+			}
+
+			if ( $code >= 200 && $code < 300 ) {
+				// success.
+				$order->set_transaction_id( $transaction_id );
+				$gateway = wc_get_payment_gateway_by_order( $order );
+				if ( $gateway instanceof CGP_Common_Gateway ) {
+					$gateway->store_recurring_transaction( $order, $transaction_id );
+				}
+				$order->payment_complete( $transaction_id );
+				$return_status = 'completed';
+			}
+
+			if ( $code >= 300 && $code < 400 ) {
+				// Failure must fail the (renewal) order, otherwise Subscriptions never retries.
+				if ( function_exists( 'wcs_order_contains_renewal' ) && wcs_order_contains_renewal( $order ) ) {
+					$order->update_status( 'failed', 'CardGate recurring payment failed (code ' . $code . ').' );
+				} else {
+					$order->update_status( 'failed' );
+				}
+				$return_status = 'failed';
+			}
+
+			if ( $code >= 700 && $code < 800 ) {
+				$order->update_status( 'on-hold' );
+				$return_status = 'waiting';
+			}
+
+			$order->add_order_note( 'Curo transaction (' . $transaction_id . ') payment ' . $return_status . '.' );
+			exit( esc_html( $transaction_id . '.' . $code ) );
 		}
 	}
 
