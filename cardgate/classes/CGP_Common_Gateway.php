@@ -45,6 +45,11 @@ class CGP_Common_Gateway extends WC_Payment_Gateway {
 	public $instructions;
 
 	/**
+	 * Meta key holding the CardGate transaction id usable for recurring payments.
+	 */
+	const RECURRING_META = '_cardgate_recurring_transaction';
+
+	/**
 	 * Constructor.
 	 */
 	public function __construct() {
@@ -61,6 +66,9 @@ class CGP_Common_Gateway extends WC_Payment_Gateway {
 
 		if ( $this->subscriptions_enabled() ) {
 			add_action( 'woocommerce_scheduled_subscription_payment_' . $this->id, array( $this, 'scheduled_subscription_payment' ), 10, 2 );
+			// Action Scheduler worker for the actual (blocking) API call.
+			add_action( 'cardgate_process_recurring_payment', array( $this, 'process_recurring_payment' ), 10, 2 );
+			add_action( 'woocommerce_subscription_failing_payment_method_updated_' . $this->id, array( $this, 'update_failing_payment_method' ), 10, 2 );
 		}
 	}
 
@@ -249,7 +257,9 @@ class CGP_Common_Gateway extends WC_Payment_Gateway {
 			$transaction->setPaymentMethod( $this->payment_method );
 
 			// Flag the transaction for recurring use when the order contains a subscription.
-			if ( $this->order_needs_recurring( $order_id ) ) {
+			if ( $this->order_needs_recurring( $order_id )
+				|| ( $this->subscriptions_enabled() && 0.0 === (float) $order->get_total() ) ) {
+				// Also covers the zero-amount "change payment method" request: only re-authorize the mandate.
 				$transaction->setRecurring( true );
 			}
 
@@ -541,15 +551,52 @@ class CGP_Common_Gateway extends WC_Payment_Gateway {
 	}
 
 	/**
-	 * Process a scheduled subscription (renewal) payment.
+	 * Queue a scheduled subscription (renewal) payment.
 	 *
-	 * Triggered by WooCommerce Subscriptions via the
-	 * woocommerce_scheduled_subscription_payment_{gateway_id} action.
+	 * Triggered by WooCommerce Subscriptions via
+	 * woocommerce_scheduled_subscription_payment_{gateway_id}. The blocking API
+	 * call itself is delegated to Action Scheduler so a slow/failing HTTPS call
+	 * to curopayments.net cannot time out the Subscriptions worker.
 	 *
 	 * @param float    $amount_to_charge The amount to charge.
-	 * @param WC_Order $renewal_order The renewal order to charge.
+	 * @param WC_Order $renewal_order    The renewal order to charge.
+	 * @return void
 	 */
 	public function scheduled_subscription_payment( $amount_to_charge, $renewal_order ) {
+		$order_id = $renewal_order->get_id();
+		$args     = array( $order_id, (float) $amount_to_charge );
+
+		if ( ! function_exists( 'as_enqueue_async_action' ) ) {
+			// Action Scheduler not available: run inline.
+			$this->process_recurring_payment( $order_id, (float) $amount_to_charge );
+			return;
+		}
+
+		if ( function_exists( 'as_has_scheduled_action' )
+			&& as_has_scheduled_action( 'cardgate_process_recurring_payment', $args, 'cardgate' ) ) {
+			return; // never queue the same renewal twice.
+		}
+
+		as_enqueue_async_action( 'cardgate_process_recurring_payment', $args, 'cardgate' );
+	}
+
+	/**
+	 * Action Scheduler worker: create the recurring transaction at CardGate.
+	 *
+	 * Idempotent; the payment is only completed once the cgp_notify callback
+	 * arrives, because recur() merely registers the transaction.
+	 *
+	 * @param int   $order_id         Renewal order id.
+	 * @param float $amount_to_charge Amount to charge.
+	 * @return void
+	 * @throws Exception When the recurring transaction cannot be created.
+	 */
+	public function process_recurring_payment( $order_id, $amount_to_charge ) {
+		$renewal_order = wc_get_order( $order_id );
+		if ( ! $renewal_order || $renewal_order->is_paid() ) {
+			return;
+		}
+
 		try {
 			$parent_transaction_id = $this->get_recurring_transaction_id( $renewal_order );
 			if ( empty( $parent_transaction_id ) ) {
@@ -568,31 +615,86 @@ class CGP_Common_Gateway extends WC_Payment_Gateway {
 			$cardgate->version()->setPluginName( 'CardGate' );
 			$cardgate->version()->setPluginVersion( get_option( 'cardgate_version' ) );
 
-			$order_id    = $renewal_order->get_id();
-			$amount      = (int) round( $amount_to_charge * 100 );
-			$reference   = 'O' . time() . $order_id;
+			$amount      = (int) round( $amount_to_charge * 100 ); // recur() requires a real int.
+			$reference   = 'O' . time() . $order_id;                // must match the callback parser.
 			$description = 'Order ' . $this->swap_order_number( $order_id );
 
-			$parent_transaction = $cardgate->transactions()->get( $parent_transaction_id );
-			$new_transaction    = $parent_transaction->recur( $amount, $reference, $description );
+			$renewal_order->update_meta_data( '_cardgate_reference', $reference );
+			$renewal_order->save();
 
+			$new_transaction = $cardgate->transactions()
+				->get( $parent_transaction_id )
+				->recur( $amount, $reference, $description );
+
+			$renewal_order->set_transaction_id( $new_transaction->getId() );
 			$renewal_order->add_order_note(
-				sprintf( 'CardGate recurring payment processed (transaction %s).', $new_transaction->getId() )
+				sprintf( 'CardGate recurring transaction %s created; awaiting callback.', $new_transaction->getId() )
 			);
-			$renewal_order->payment_complete( $new_transaction->getId() );
+			$this->store_recurring_transaction( $renewal_order, $parent_transaction_id );
+			$renewal_order->update_status( 'on-hold' );
+			$renewal_order->save();
 		} catch ( Exception $e ) {
 			$renewal_order->update_status(
 				'failed',
 				sprintf( 'CardGate recurring payment failed: %s', $e->getMessage() )
 			);
+			throw $e; // let Action Scheduler record the failure.
+		}
+	}
+
+	/**
+	 * Persist the CardGate transaction id that may be used for recurring payments.
+	 *
+	 * @param WC_Order $order          Order the transaction belongs to.
+	 * @param string   $transaction_id CardGate transaction id.
+	 * @return void
+	 */
+	public function store_recurring_transaction( $order, $transaction_id ) {
+		if ( ! $this->subscriptions_enabled() || empty( $transaction_id ) ) {
+			return;
+		}
+
+		$order->update_meta_data( self::RECURRING_META, $transaction_id );
+		$order->save();
+
+		if ( ! function_exists( 'wcs_get_subscriptions_for_order' ) ) {
+			return;
+		}
+
+		$subscriptions = wcs_get_subscriptions_for_order(
+			$order,
+			array( 'order_type' => array( 'parent', 'renewal', 'switch', 'resubscribe' ) )
+		);
+		foreach ( $subscriptions as $subscription ) {
+			$subscription->update_meta_data( self::RECURRING_META, $transaction_id );
+			$subscription->set_payment_method( $this->id );
+			$subscription->save();
+		}
+	}
+
+	/**
+	 * Copy the new token onto the subscription after a payment-method update.
+	 *
+	 * @param WC_Subscription $subscription  Subscription being updated.
+	 * @param WC_Order        $renewal_order Renewal order holding the new token.
+	 * @return void
+	 */
+	public function update_failing_payment_method( $subscription, $renewal_order ) {
+		$transaction_id = $renewal_order->get_meta( self::RECURRING_META );
+		if ( empty( $transaction_id ) ) {
+			$transaction_id = $renewal_order->get_transaction_id();
+		}
+		if ( ! empty( $transaction_id ) ) {
+			$subscription->update_meta_data( self::RECURRING_META, $transaction_id );
+			$subscription->save();
 		}
 	}
 
 	/**
 	 * Find the CardGate transaction id to use for a recurring payment.
 	 *
-	 * Looks at the subscriptions related to the renewal order and returns the
-	 * transaction id of the original (parent) order.
+	 * Prefers the stored recurring meta and falls back to the transaction id of
+	 * the subscription or the original (parent) order.
 	 *
 	 * @param WC_Order $renewal_order The renewal order.
 	 * @return string|false
@@ -604,13 +706,20 @@ class CGP_Common_Gateway extends WC_Payment_Gateway {
 
 		$subscriptions = wcs_get_subscriptions_for_renewal_order( $renewal_order );
 		foreach ( $subscriptions as $subscription ) {
+			$transaction_id = $subscription->get_meta( self::RECURRING_META );
+			if ( ! empty( $transaction_id ) ) {
+				return $transaction_id;
+			}
 			$transaction_id = $subscription->get_transaction_id();
 			if ( ! empty( $transaction_id ) ) {
 				return $transaction_id;
 			}
 			$parent_order = $subscription->get_parent();
 			if ( $parent_order ) {
-				$transaction_id = $parent_order->get_transaction_id();
+				$transaction_id = $parent_order->get_meta( self::RECURRING_META );
+				if ( empty( $transaction_id ) ) {
+					$transaction_id = $parent_order->get_transaction_id();
+				}
 				if ( ! empty( $transaction_id ) ) {
 					return $transaction_id;
 				}
