@@ -20,54 +20,89 @@
 
 require_once WP_PLUGIN_DIR . '/cardgate/cardgate-clientlib-php/init.php';
 
-if ( ! function_exists( 'cardgate_is_subscriptions_active' ) ) {
+/*
+ * This plugin does not bundle or load Action Scheduler itself: it relies solely
+ * on the copy that ships with WooCommerce. WooCommerce initialises Action
+ * Scheduler on plugins_loaded, so the as_*() functions are available from init
+ * onwards. All CardGate usage is guarded with function_exists() so the plugin
+ * keeps working when Action Scheduler is unavailable.
+ */
+
+if ( ! function_exists( 'cardgate_subscriptions_active' ) ) {
 	/**
-	 * Check whether the WooCommerce Subscriptions plugin is installed and activated.
+	 * Check whether the WooCommerce Subscriptions plugin is available.
 	 *
-	 * @return bool True when WooCommerce Subscriptions is active.
+	 * @return bool True when subscriptions can be used with this plugin.
 	 */
-	function cardgate_is_subscriptions_active() {
-		if ( class_exists( 'WC_Subscriptions' ) ) {
-			return true;
-		}
-
-		$active_plugins = (array) get_option( 'active_plugins', array() );
-		if ( is_multisite() ) {
-			$active_plugins = array_merge( $active_plugins, array_keys( (array) get_site_option( 'active_sitewide_plugins', array() ) ) );
-		}
-
-		foreach ( $active_plugins as $plugin ) {
-			if ( 'woocommerce-subscriptions/woocommerce-subscriptions.php' === $plugin ) {
-				return true;
-			}
-		}
-
-		return false;
+	function cardgate_subscriptions_active() {
+		return class_exists( 'WC_Subscriptions' );
 	}
 }
 
-if ( ! function_exists( 'cardgate_load_action_scheduler' ) ) {
+if ( ! function_exists( 'cardgate_spawn_wp_cron' ) ) {
 	/**
-	 * Load the Action Scheduler library, but only when WooCommerce Subscriptions is active.
+	 * Trigger wp-cron.php so pending Action Scheduler jobs are picked up.
 	 *
-	 * Action Scheduler must be loaded no later than the plugins_loaded hook, see
-	 * https://actionscheduler.org/usage/ .
+	 * Renewals of subscriptions are handled by the Action Scheduler that ships
+	 * with WooCommerce, and that scheduler is only run when wp-cron.php runs.
+	 * On sites with little traffic, or when WP-Cron is disabled, the queue can
+	 * stall; this triggers a non blocking loopback request to wp-cron.php.
+	 * The request is throttled to at most once per minute.
 	 *
+	 * @param bool $force Skip the throttle and spawn immediately.
 	 * @return void
 	 */
-	function cardgate_load_action_scheduler() {
-		if ( ! cardgate_is_subscriptions_active() ) {
+	function cardgate_spawn_wp_cron( $force = false ) {
+		if ( ! cardgate_subscriptions_active() ) {
+			return;
+		}
+		if ( defined( 'DOING_CRON' ) && DOING_CRON ) {
+			return;
+		}
+		if ( wp_installing() || ( defined( 'WP_INSTALLING' ) && WP_INSTALLING ) ) {
 			return;
 		}
 
-		$action_scheduler = WP_PLUGIN_DIR . '/action-scheduler/action-scheduler.php';
-		if ( file_exists( $action_scheduler ) ) {
-			require_once $action_scheduler;
+		$lock_key = 'cardgate_cron_spawn_lock';
+		if ( ! $force && false !== get_transient( $lock_key ) ) {
+			return;
 		}
+		set_transient( $lock_key, time(), MINUTE_IN_SECONDS );
+
+		$doing_wp_cron = sprintf( '%.22F', microtime( true ) );
+		$cron_url      = add_query_arg( 'doing_wp_cron', $doing_wp_cron, site_url( 'wp-cron.php' ) );
+
+		wp_remote_post(
+			$cron_url,
+			array(
+				'timeout'   => 0.01,
+				'blocking'  => false,
+				'sslverify' => apply_filters( 'https_local_ssl_verify', false ),
+			)
+		);
 	}
 }
 
-add_action( 'plugins_loaded', 'cardgate_load_action_scheduler', 0 );
+if ( ! function_exists( 'cardgate_maybe_spawn_wp_cron' ) ) {
+	/**
+	 * Spawn wp-cron.php when CardGate subscription work is waiting in the queue.
+	 *
+	 * @return void
+	 */
+	function cardgate_maybe_spawn_wp_cron() {
+		if ( ! cardgate_subscriptions_active() ) {
+			return;
+		}
+		if ( wp_doing_ajax() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+			return;
+		}
+
+		cardgate_spawn_wp_cron();
+	}
+}
+
+add_action( 'shutdown', 'cardgate_maybe_spawn_wp_cron' );
+add_action( 'cardgate_recurring_payment_queued', 'cardgate_spawn_wp_cron' );
 
 if ( ! function_exists( 'cardgate_unschedule_recurring_actions' ) ) {
 	/**
