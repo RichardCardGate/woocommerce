@@ -578,6 +578,9 @@ class CGP_Common_Gateway extends WC_Payment_Gateway {
 		}
 
 		as_enqueue_async_action( 'cardgate_process_recurring_payment', $args, 'cardgate' );
+
+		// Make sure the queue runner is started, so the renewal is not left waiting.
+		do_action( 'cardgate_recurring_payment_queued', true );
 	}
 
 	/**
