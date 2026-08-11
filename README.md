@@ -82,6 +82,71 @@ and **WooCommerce plug-in 3.x or higher**.
 
 10. **N.B.** The settings for **Live mode** can differ from those of **Test mode**, See also point number 4.
 
+## Subscriptions
+
+The CardGate plug-in supports **recurring payments** through the
+[WooCommerce Subscriptions](https://woocommerce.com/products/woocommerce-subscriptions/) plug-in.
+Subscription functionality is only active when **WooCommerce Subscriptions is installed and activated**;
+without it the CardGate payment methods behave as regular one-off payment methods.
+
+### Supported payment methods
+
+Subscriptions are available for the following CardGate payment methods:
+
+- **Creditcard**
+- **iDEAL**
+- **Bancontact**
+- **SEPA Direct Debit**
+- **Sofort / Online Ueberweisen**
+- **Przelewy24**
+
+All other CardGate payment methods can only be used for **one-off** orders; WooCommerce
+Subscriptions does not offer them in the checkout when the cart contains a subscription product.
+
+### Supported subscription options
+
+For the payment methods listed above the plug-in supports:
+
+- **Automatic renewals** – renewal orders are charged automatically by CardGate.
+- **Cancellation**, **suspension** and **reactivation** of a subscription.
+- **Amount changes** and **date changes** on an existing subscription.
+- **Payment method changes** by the **customer** as well as by the **shop admin**.
+- **Multiple subscriptions** in one order.
+
+### How it works
+
+1. On the **first (parent) payment** the transaction is flagged at CardGate as **recurring**.
+   The customer authorizes the mandate/token during that payment.
+2. The CardGate transaction ID of that first payment is stored on the order and on the
+   subscription, and is used as the **parent transaction** for all following renewals.
+3. When WooCommerce Subscriptions schedules a **renewal payment**, the plug-in queues a job in the
+   **Action Scheduler** that ships with WooCommerce. The actual call to CardGate is done in the
+   background, so a slow API call can never time out the checkout or the Subscriptions worker.
+4. The renewal order is set to **on-hold** until the CardGate **callback (notify)** confirms the
+   payment. Only then the order is set to **processing/completed**. When the recurring transaction
+   cannot be created, or the callback reports a failure, the renewal order is set to **failed** and
+   WooCommerce Subscriptions handles the retry.
+5. When a customer changes the payment method of a subscription, a **zero-amount transaction** is
+   created to re-authorize the mandate. The new transaction ID replaces the stored one.
+
+### Requirements and notes for subscriptions
+
+- **WooCommerce Subscriptions** must be installed and activated.
+- **WP-Cron must be able to run**, because renewals are processed by the Action Scheduler, which is
+  triggered by `wp-cron.php`. On low-traffic sites, or when `DISABLE_WP_CRON` is set, the plug-in
+  triggers a throttled (max once per minute) loopback request to `wp-cron.php` so queued renewals are
+  not left waiting. If you have disabled WP-Cron, make sure a **system cron** calls
+  `wp-cron.php` (or `wp cron event run --due-now`) at least **every 5 minutes**.
+- The **CardGate callback URL** must be publicly reachable; renewals are only completed after the
+  callback has been received.
+- Make sure recurring payments are **enabled for your site in [My CardGate](https://my.cardgate.com/)**
+  for every payment method you want to use for subscriptions.
+- Pending renewal jobs can be inspected under **WooCommerce, Status, Scheduled Actions**
+  (group `cardgate`, action `cardgate_process_recurring_payment`). Deactivating the plug-in removes
+  the pending CardGate renewal jobs.
+- Test subscriptions in **Test mode** first; renewal dates can be shortened with the WooCommerce
+  Subscriptions test settings.
+
 ## Requirements
 
 No further requirements.
