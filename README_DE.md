@@ -81,6 +81,78 @@ und **WooCommerce Plugin 3.x oder höher**.
  
 10. **Achtung**: Die Einstellungen für den  **Livemodus** können anders als die Einstellungen des  **Testmodus** sein. Siehe auch Punkt 4. 
 
+## Abonnements
+
+Das CardGate Plug-in unterstützt **wiederkehrende Zahlungen** über das
+[WooCommerce Subscriptions](https://woocommerce.com/products/woocommerce-subscriptions/) Plug-in.
+Die Abonnement-Funktionalität ist nur aktiv, wenn **WooCommerce Subscriptions installiert und
+aktiviert** ist; ohne dieses Plug-in verhalten sich die CardGate Zahlungsmethoden wie normale
+Einmalzahlungsmethoden.
+
+### Unterstützte Zahlungsmethoden
+
+Abonnements sind für die folgenden CardGate Zahlungsmethoden verfügbar:
+
+- **Kreditkarte**
+- **iDEAL**
+- **Bancontact**
+- **SEPA-Lastschrift (Direct Debit)**
+- **Sofort / Online Ueberweisen**
+- **Przelewy24**
+
+Alle anderen CardGate Zahlungsmethoden können nur für **einmalige** Bestellungen verwendet werden;
+WooCommerce Subscriptions bietet sie im Checkout nicht an, wenn der Warenkorb ein Abonnementprodukt
+enthält.
+
+### Unterstützte Abonnement-Optionen
+
+Für die oben genannten Zahlungsmethoden unterstützt das Plug-in:
+
+- **Automatische Verlängerungen** – Verlängerungsbestellungen werden automatisch von CardGate belastet.
+- **Kündigung**, **Aussetzung** und **Reaktivierung** eines Abonnements.
+- **Betragsänderungen** und **Datumsänderungen** bei einem bestehenden Abonnement.
+- **Änderung der Zahlungsmethode** durch den **Kunden** sowie durch den **Shop-Administrator**.
+- **Mehrere Abonnements** in einer Bestellung.
+
+### Wie es funktioniert
+
+1. Bei der **ersten (Eltern-)Zahlung** wird die Transaktion bei CardGate als **recurring** markiert.
+   Der Kunde autorisiert während dieser Zahlung das Mandat bzw. das Token.
+2. Die CardGate Transaktions-ID dieser ersten Zahlung wird bei der Bestellung und beim Abonnement
+   gespeichert und dient als **Elterntransaktion** für alle folgenden Verlängerungen.
+3. Wenn WooCommerce Subscriptions eine **Verlängerungszahlung** einplant, stellt das Plug-in einen
+   Job in den **Action Scheduler** ein, der mit WooCommerce mitgeliefert wird. Der eigentliche Aufruf
+   an CardGate erfolgt im Hintergrund, sodass ein langsamer API-Aufruf niemals einen Timeout des
+   Checkouts oder des Subscriptions-Workers verursachen kann.
+4. Die Verlängerungsbestellung erhält den Status **in Wartestellung (on-hold)**, bis der CardGate
+   **Callback (notify)** die Zahlung bestätigt. Erst danach wird die Bestellung auf
+   **in Bearbeitung/abgeschlossen** gesetzt. Kann die wiederkehrende Transaktion nicht erstellt
+   werden oder meldet der Callback einen Fehlschlag, wird die Verlängerungsbestellung auf
+   **fehlgeschlagen** gesetzt und WooCommerce Subscriptions übernimmt den erneuten Versuch.
+5. Wenn ein Kunde die Zahlungsmethode eines Abonnements ändert, wird eine **Transaktion mit Betrag
+   null** erstellt, um das Mandat erneut zu autorisieren. Die neue Transaktions-ID ersetzt die
+   gespeicherte ID.
+
+### Anforderungen und Hinweise für Abonnements
+
+- **WooCommerce Subscriptions** muss installiert und aktiviert sein.
+- **WP-Cron muss ausgeführt werden können**, da Verlängerungen vom Action Scheduler verarbeitet
+  werden, der über `wp-cron.php` gestartet wird. Auf Seiten mit wenig Verkehr oder wenn
+  `DISABLE_WP_CRON` gesetzt ist, sendet das Plug-in eine gedrosselte (maximal einmal pro Minute)
+  Loopback-Anfrage an `wp-cron.php`, damit wartende Verlängerungen nicht liegen bleiben. Wenn Sie
+  WP-Cron deaktiviert haben, stellen Sie sicher, dass ein **System-Cron** mindestens **alle 5
+  Minuten** `wp-cron.php` (oder `wp cron event run --due-now`) aufruft.
+- Die **CardGate Callback-URL** muss öffentlich erreichbar sein; Verlängerungen werden erst
+  abgeschlossen, nachdem der Callback empfangen wurde.
+- Stellen Sie sicher, dass wiederkehrende Zahlungen **für Ihre Website in
+  [Mein CardGate](https://my.cardgate.com/)** für jede Zahlungsmethode aktiviert sind, die Sie für
+  Abonnements verwenden möchten.
+- Wartende Verlängerungsjobs können unter **WooCommerce, Status, Geplante Aktionen** eingesehen
+  werden (Gruppe `cardgate`, Aktion `cardgate_process_recurring_payment`). Beim Deaktivieren des
+  Plug-ins werden die wartenden CardGate Verlängerungsjobs entfernt.
+- Testen Sie Abonnements zuerst im **Testmodus**; Verlängerungsdaten können mit den
+  Testeinstellungen von WooCommerce Subscriptions verkürzt werden.
+
 ## Anforderungen
 
 Keine weiteren Anforderungen.
