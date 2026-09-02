@@ -119,6 +119,47 @@ if ( ! function_exists( 'cardgate_unschedule_recurring_actions' ) ) {
 
 register_deactivation_hook( __FILE__, 'cardgate_unschedule_recurring_actions' );
 
+if ( ! function_exists( 'cardgate_run_recurring_payment' ) ) {
+	/**
+	 * Action Scheduler worker for queued CardGate recurring payments.
+	 *
+	 * This callback is deliberately registered on plugin level instead of in the
+	 * gateway constructor. Action Scheduler runs the queue from wp-cron.php, and
+	 * in such a request WooCommerce never instantiates the payment gateways
+	 * (WC()->payment_gateways() is only created on demand). The gateway
+	 * constructors, and therefore any hook they add, would not exist and the
+	 * queued action would run without a callback, leaving the renewal order in
+	 * 'pending' ("Waiting for payment") forever.
+	 *
+	 * @param int   $order_id         Renewal order id.
+	 * @param float $amount_to_charge Amount to charge.
+	 * @return void
+	 */
+	function cardgate_run_recurring_payment( $order_id, $amount_to_charge ) {
+		if ( ! function_exists( 'WC' ) || ! function_exists( 'wc_get_order' ) ) {
+			return;
+		}
+
+		$renewal_order = wc_get_order( $order_id );
+		if ( ! $renewal_order ) {
+			return;
+		}
+
+		// Force the payment gateways to be loaded in this request.
+		WC()->payment_gateways();
+
+		$gateway = wc_get_payment_gateway_by_order( $renewal_order );
+		if ( ! $gateway instanceof CGP_Common_Gateway ) {
+			$renewal_order->add_order_note( 'CardGate recurring payment skipped: payment gateway not available.' );
+			return;
+		}
+
+		$gateway->process_recurring_payment( $order_id, (float) $amount_to_charge );
+	}
+}
+
+add_action( 'cardgate_process_recurring_payment', 'cardgate_run_recurring_payment', 10, 2 );
+
 /**
  * CardGate Class.
  */
