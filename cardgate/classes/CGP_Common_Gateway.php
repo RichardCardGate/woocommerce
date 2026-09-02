@@ -66,8 +66,9 @@ class CGP_Common_Gateway extends WC_Payment_Gateway {
 
 		if ( $this->subscriptions_enabled() ) {
 			add_action( 'woocommerce_scheduled_subscription_payment_' . $this->id, array( $this, 'scheduled_subscription_payment' ), 10, 2 );
-			// Action Scheduler worker for the actual (blocking) API call.
-			add_action( 'cardgate_process_recurring_payment', array( $this, 'process_recurring_payment' ), 10, 2 );
+			// The Action Scheduler worker for the actual (blocking) API call is
+			// registered on plugin level, because the gateways are not loaded in
+			// the cron request that runs the queue.
 			add_action( 'woocommerce_subscription_failing_payment_method_updated_' . $this->id, array( $this, 'update_failing_payment_method' ), 10, 2 );
 		}
 	}
